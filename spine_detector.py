@@ -1,10 +1,86 @@
 
-import cv2
-from ultralytics import YOLO
+import logging
 from pathlib import Path
+
+import cv2
+import numpy as np
+from paddleocr import PaddleOCR
+from ultralytics import YOLO
 
 # Smaller version of the model used in the GitHub project
 model = YOLO("yolo11n-seg.pt")
+_ocr_engine: PaddleOCR | None = None
+MAX_BOOK_WIDTH_RATIO = 0.3
+logger = logging.getLogger(__name__)
+
+
+def get_ocr_engine() -> PaddleOCR:
+    global _ocr_engine
+    if _ocr_engine is None:
+        _ocr_engine = PaddleOCR(
+            lang="en",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            enable_mkldnn=False,
+        )
+    return _ocr_engine
+
+
+def recognize_book_text(image_crop: np.ndarray, ocr_engine: PaddleOCR) -> str:
+    if image_crop.size == 0:
+        return ""
+
+    if image_crop.shape[0] > image_crop.shape[1]:
+        candidates = [
+            cv2.rotate(image_crop, cv2.ROTATE_90_CLOCKWISE),
+            cv2.rotate(image_crop, cv2.ROTATE_90_COUNTERCLOCKWISE),
+        ]
+    else:
+        candidates = [image_crop]
+
+    best_text = ""
+    best_score = (-1.0, -1)
+    for candidate in candidates:
+        texts: list[str] = []
+        confidence_total = 0.0
+        confidence_count = 0
+        for result in ocr_engine.predict(input=candidate):
+            result_data = result.json
+            if callable(result_data):
+                result_data = result_data()
+            if not isinstance(result_data, dict):
+                raise TypeError("PaddleOCR returned an unexpected result format.")
+
+            payload = result_data.get("res", result_data)
+            recognized_lines = payload.get("rec_texts", [])
+            if recognized_lines is None:
+                recognized_lines = []
+            confidence_scores = payload.get("rec_scores", [])
+            if confidence_scores is None:
+                confidence_scores = []
+            texts.extend(
+                text.strip()
+                for text in recognized_lines
+                if isinstance(text, str) and text.strip()
+            )
+            confidence_total += sum(
+                float(score) for score in confidence_scores
+            )
+            confidence_count += len(confidence_scores)
+
+        text = " ".join(texts)
+        mean_confidence = (
+            confidence_total / confidence_count
+            if confidence_count > 0
+            else 0.0
+        )
+        score = (mean_confidence, len(text))
+        if score > best_score:
+            best_text = text
+            best_score = score
+
+    return best_text
 
 
 def calculate_book_size_and_location(
@@ -71,6 +147,14 @@ def detect_books(image_path):
                 int, box.xyxy[0].tolist()
             )
 
+            width_ratio = (x2 - x1) / image_width
+            if width_ratio > MAX_BOOK_WIDTH_RATIO:
+                logger.warning(
+                    "Skipping broad book detection covering %.0f%% of the image width.",
+                    width_ratio * 100,
+                )
+                continue
+
             confidence = float(box.conf[0])
             measurements = calculate_book_size_and_location(
                 x1, y1, x2, y2, image_width, image_height
@@ -92,6 +176,10 @@ def detect_books(image_path):
     for book_id, book in enumerate(books, start=1):
         book["book_id"] = book_id
         x1, y1, x2, y2 = book["x1"], book["y1"], book["x2"], book["y2"]
+        book_crop = image[y1:y2, x1:x2]
+        book["recognized_text"] = recognize_book_text(
+            book_crop, get_ocr_engine()
+        )
         cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
             output,

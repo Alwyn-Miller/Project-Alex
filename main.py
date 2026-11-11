@@ -19,6 +19,10 @@ def main():
     print(f"Detected {len(books)} books")
 
     for book in books:
+        print(
+            f"Book {book['book_id']}: "
+            f"{book['recognized_text'] or 'No text detected'}"
+        )
         print(book)
 
 
